@@ -27,6 +27,7 @@ genai.configure(api_key=api_key)
 _SELECTED_MODEL_NAME = None
 _SELECTED_MODEL = None
 MAX_RESUME_SIZE_MB = int(os.getenv("MAX_RESUME_SIZE_MB", "10"))
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "2"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("resai-backend")
@@ -212,23 +213,46 @@ def image_to_part(image):
     }
 
 
+def safe_generate_content(payload, context: str) -> str:
+    try:
+        model = get_model()
+        response = model.generate_content(payload)
+        return (response.text or "").strip()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        err = str(exc).lower()
+        if any(token in err for token in ["quota", "rate limit", "resource exhausted", "429"]):
+            raise HTTPException(
+                status_code=429,
+                detail=f"Model is rate-limited for {context}. Please retry in a minute.",
+            ) from exc
+        if any(token in err for token in ["deadline", "timed out", "timeout"]):
+            raise HTTPException(
+                status_code=504,
+                detail=f"Model request timed out for {context}. Please retry.",
+            ) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"Model request failed for {context}.",
+        ) from exc
+
+
 def extract_resume_text(images) -> str:
-    model = get_model()
     text = []
-    for image in images:
+    for image in images[:MAX_OCR_PAGES]:
         try:
             prompt = "Extract all text from this image, preserving line breaks and formatting as much as possible."
-            response = model.generate_content([prompt, image_to_part(image)])
-            text.append(response.text)
-        except Exception:
+            extracted = safe_generate_content([prompt, image_to_part(image)], context="resume OCR")
+            if extracted:
+                text.append(extracted)
+        except HTTPException:
             continue
     return "\n".join(text)
 
 
 def run_prompt_with_resume(prompt: str, first_page_part: dict, job_description: str) -> str:
-    model = get_model()
-    response = model.generate_content([prompt, first_page_part, job_description])
-    return response.text
+    return safe_generate_content([prompt, first_page_part, job_description], context="resume prompt")
 
 
 def parse_percentage(text: str) -> float:
@@ -242,14 +266,16 @@ def parse_percentage(text: str) -> float:
 
 
 def extract_keywords(job_description: str) -> List[str]:
-    model = get_model()
     prompt = (
         "Extract top 15 important keywords from this job description. "
         "Return only a comma-separated list.\n\n"
         f"{job_description}"
     )
-    response = model.generate_content(prompt)
-    return [item.strip() for item in response.text.split(",") if item.strip()]
+    try:
+        response = safe_generate_content(prompt, context="keyword extraction")
+    except HTTPException:
+        return []
+    return [item.strip() for item in response.split(",") if item.strip()]
 
 
 def tavily_job_search(resume_text: str, job_description: str, count: int = 5) -> str:
@@ -257,19 +283,19 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
     if not tavily_api_key:
         return "TAVILY_API_KEY is missing"
 
-    model = get_model()
-
-    skills_response = model.generate_content(
+    skills_response = safe_generate_content(
         "Extract top 10 professional skills from this resume as a comma-separated list:\n"
-        f"{resume_text}"
+        f"{resume_text}",
+        context="resume skill extraction",
     )
-    resume_skills = skills_response.text.strip()
+    resume_skills = skills_response.strip()
 
-    title_response = model.generate_content(
+    title_response = safe_generate_content(
         "Extract the exact job title from this job description. Return only the title.\n"
-        f"{job_description}"
+        f"{job_description}",
+        context="job title extraction",
     )
-    job_title = title_response.text.strip().split("\n")[0]
+    job_title = title_response.strip().split("\n")[0]
 
     search_query = f'"{job_title}" jobs {" ".join(resume_skills.split(",")[:3])} hiring now'
 
@@ -281,7 +307,10 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
         "max_results": count,
         "include_raw_content": True,
     }
-    response = requests.post("https://api.tavily.com/search", json=payload, timeout=60)
+    try:
+        response = requests.post("https://api.tavily.com/search", json=payload, timeout=60)
+    except requests.RequestException:
+        return "Job search service is temporarily unavailable. Please retry shortly."
     if response.status_code != 200:
         return f"Tavily API error {response.status_code}: {response.text}"
 
@@ -302,9 +331,9 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
             f"Job Description: {snippet}"
         )
         try:
-            relevance = model.generate_content(relevance_prompt).text
-        except Exception as exc:
-            relevance = f"Relevance analysis failed: {exc}"
+            relevance = safe_generate_content(relevance_prompt, context="job relevance analysis")
+        except HTTPException:
+            relevance = "Relevance analysis unavailable for this result."
 
         lines.append(f"### {idx}. {title}")
         lines.append(f"Link: [{link}]({link})")
@@ -348,7 +377,6 @@ async def optimize_resume(
     pdf_bytes = await resume.read()
     validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
-    resume_text = extract_resume_text(images)
 
     prompt = (
         "You are a career coach. Provide 5 specific actionable resume improvements based on this resume and job description. "
