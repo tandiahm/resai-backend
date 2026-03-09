@@ -1,8 +1,10 @@
 import base64
+import hashlib
 import io
 import logging
 import os
 import re
+import time
 import traceback
 import uuid
 from typing import List
@@ -28,9 +30,14 @@ _SELECTED_MODEL_NAME = None
 _SELECTED_MODEL = None
 MAX_RESUME_SIZE_MB = int(os.getenv("MAX_RESUME_SIZE_MB", "10"))
 MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "2"))
+MODEL_RETRY_ATTEMPTS = int(os.getenv("MODEL_RETRY_ATTEMPTS", "3"))
+MODEL_RETRY_BASE_SECONDS = float(os.getenv("MODEL_RETRY_BASE_SECONDS", "1.0"))
+ANALYSIS_CACHE_TTL_SECONDS = int(os.getenv("ANALYSIS_CACHE_TTL_SECONDS", "86400"))
+ANALYSIS_CACHE_MAX_ENTRIES = int(os.getenv("ANALYSIS_CACHE_MAX_ENTRIES", "500"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("resai-backend")
+analysis_cache = {}
 
 
 class AnalyzeResponse(BaseModel):
@@ -213,29 +220,89 @@ def image_to_part(image):
     }
 
 
+def prune_analysis_cache():
+    now = time.time()
+    expired = [k for k, v in analysis_cache.items() if now - v["ts"] > ANALYSIS_CACHE_TTL_SECONDS]
+    for key in expired:
+        analysis_cache.pop(key, None)
+    if len(analysis_cache) > ANALYSIS_CACHE_MAX_ENTRIES:
+        oldest = sorted(analysis_cache.items(), key=lambda item: item[1]["ts"])[: len(analysis_cache) - ANALYSIS_CACHE_MAX_ENTRIES]
+        for key, _ in oldest:
+            analysis_cache.pop(key, None)
+
+
+def get_cached_analysis(cache_key: str):
+    prune_analysis_cache()
+    hit = analysis_cache.get(cache_key)
+    if not hit:
+        return None
+    return hit["analysis"]
+
+
+def set_cached_analysis(cache_key: str, analysis: str):
+    prune_analysis_cache()
+    analysis_cache[cache_key] = {"analysis": analysis, "ts": time.time()}
+
+
 def safe_generate_content(payload, context: str) -> str:
-    try:
-        model = get_model()
-        response = model.generate_content(payload)
-        return (response.text or "").strip()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        err = str(exc).lower()
+    last_exc = None
+    for attempt in range(MODEL_RETRY_ATTEMPTS):
+        try:
+            model = get_model()
+            response = model.generate_content(payload)
+            return (response.text or "").strip()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            err = str(exc).lower()
+            is_rate_limited = any(token in err for token in ["quota", "rate limit", "resource exhausted", "429"])
+            is_timeout = any(token in err for token in ["deadline", "timed out", "timeout"])
+
+            if (is_rate_limited or is_timeout) and attempt < MODEL_RETRY_ATTEMPTS - 1:
+                delay = MODEL_RETRY_BASE_SECONDS * (2 ** attempt)
+                logger.warning(
+                    "Retrying model call context=%s attempt=%s/%s delay=%.1fs error=%s",
+                    context,
+                    attempt + 1,
+                    MODEL_RETRY_ATTEMPTS,
+                    delay,
+                    str(exc),
+                )
+                time.sleep(delay)
+                continue
+
+            if is_rate_limited:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Model is rate-limited for {context}. Please retry in a minute.",
+                ) from exc
+            if is_timeout:
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Model request timed out for {context}. Please retry.",
+                ) from exc
+            raise HTTPException(
+                status_code=502,
+                detail=f"Model request failed for {context}.",
+            ) from exc
+    if last_exc:
+        err = str(last_exc).lower()
         if any(token in err for token in ["quota", "rate limit", "resource exhausted", "429"]):
             raise HTTPException(
                 status_code=429,
                 detail=f"Model is rate-limited for {context}. Please retry in a minute.",
-            ) from exc
+            ) from last_exc
         if any(token in err for token in ["deadline", "timed out", "timeout"]):
             raise HTTPException(
                 status_code=504,
                 detail=f"Model request timed out for {context}. Please retry.",
-            ) from exc
+            ) from last_exc
         raise HTTPException(
             status_code=502,
             detail=f"Model request failed for {context}.",
-        ) from exc
+        ) from last_exc
+    raise HTTPException(status_code=502, detail=f"Model request failed for {context}.")
 
 
 def extract_resume_text(images) -> str:
@@ -266,16 +333,20 @@ def parse_percentage(text: str) -> float:
 
 
 def extract_keywords(job_description: str) -> List[str]:
-    prompt = (
-        "Extract top 15 important keywords from this job description. "
-        "Return only a comma-separated list.\n\n"
-        f"{job_description}"
-    )
-    try:
-        response = safe_generate_content(prompt, context="keyword extraction")
-    except HTTPException:
-        return []
-    return [item.strip() for item in response.split(",") if item.strip()]
+    stop_words = {
+        "the", "and", "for", "with", "that", "this", "from", "you", "your", "our", "are", "will",
+        "have", "has", "had", "not", "but", "all", "any", "job", "role", "work", "team", "ability",
+        "experience", "years", "required", "preferred", "skills", "skill", "using", "their", "they",
+        "can", "should", "into", "about", "who", "what", "where", "when", "how", "more", "must",
+    }
+    words = re.findall(r"[A-Za-z][A-Za-z0-9+.#-]{2,}", job_description.lower())
+    freq = {}
+    for word in words:
+        if word in stop_words:
+            continue
+        freq[word] = freq.get(word, 0) + 1
+    ordered = sorted(freq.items(), key=lambda x: (-x[1], x[0]))
+    return [word for word, _ in ordered[:15]]
 
 
 def tavily_job_search(resume_text: str, job_description: str, count: int = 5) -> str:
@@ -355,6 +426,11 @@ async def analyze_resume(
 ):
     pdf_bytes = await resume.read()
     validate_resume_upload(resume.filename or "", pdf_bytes)
+    cache_key = hashlib.sha256(pdf_bytes + b"||" + job_description.strip().encode("utf-8")).hexdigest()
+    cached_analysis = get_cached_analysis(cache_key)
+    if cached_analysis:
+        return AnalyzeResponse(match_percentage=parse_percentage(cached_analysis), analysis=cached_analysis)
+
     images = pdf_to_images(pdf_bytes)
     if not images:
         raise HTTPException(status_code=400, detail="No pages found in uploaded PDF")
@@ -366,6 +442,7 @@ async def analyze_resume(
         "Start with percentage line as 'XX%'."
     )
     analysis = run_prompt_with_resume(prompt, first_page_part, job_description)
+    set_cached_analysis(cache_key, analysis)
     return AnalyzeResponse(match_percentage=parse_percentage(analysis), analysis=analysis)
 
 
