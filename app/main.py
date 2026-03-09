@@ -1,14 +1,18 @@
 import base64
 import io
+import logging
 import os
 import re
+import traceback
+import uuid
 from typing import List
 
 import google.generativeai as genai
 import pdf2image
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -22,6 +26,10 @@ genai.configure(api_key=api_key)
 
 _SELECTED_MODEL_NAME = None
 _SELECTED_MODEL = None
+MAX_RESUME_SIZE_MB = int(os.getenv("MAX_RESUME_SIZE_MB", "10"))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("resai-backend")
 
 
 class AnalyzeResponse(BaseModel):
@@ -51,6 +59,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = str(uuid.uuid4())
+    logger.error(
+        "Unhandled error request_id=%s path=%s method=%s error=%s\n%s",
+        request_id,
+        request.url.path,
+        request.method,
+        str(exc),
+        traceback.format_exc(),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"Internal server error (request_id={request_id}).",
+        },
+    )
 
 
 def choose_model_name(preferred_env_var: str = "GOOGLE_MODEL") -> str:
@@ -163,6 +190,17 @@ def pdf_to_images(pdf_bytes: bytes):
                 f"Original error: {exc}"
             ),
         ) from exc
+
+
+def validate_resume_upload(filename: str, pdf_bytes: bytes):
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Resume must be a PDF file.")
+    max_bytes = MAX_RESUME_SIZE_MB * 1024 * 1024
+    if len(pdf_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF is too large. Max allowed size is {MAX_RESUME_SIZE_MB}MB.",
+        )
 
 
 def image_to_part(image):
@@ -287,6 +325,7 @@ async def analyze_resume(
     job_description: str = Form(...),
 ):
     pdf_bytes = await resume.read()
+    validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
     if not images:
         raise HTTPException(status_code=400, detail="No pages found in uploaded PDF")
@@ -307,6 +346,7 @@ async def optimize_resume(
     job_description: str = Form(...),
 ):
     pdf_bytes = await resume.read()
+    validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
     resume_text = extract_resume_text(images)
 
@@ -328,6 +368,7 @@ async def cover_letter(
     focus_areas: str = Form(default="balanced"),
 ):
     pdf_bytes = await resume.read()
+    validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
 
     prompt = (
@@ -345,6 +386,7 @@ async def interview_prep(
     job_description: str = Form(...),
 ):
     pdf_bytes = await resume.read()
+    validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
     prompt = (
         "Generate interview prep with 5 technical questions, 3 behavioral questions, and 2 gap-risk questions. "
@@ -360,6 +402,7 @@ async def market_position(
     job_description: str = Form(...),
 ):
     pdf_bytes = await resume.read()
+    validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
     prompt = (
         "Create ideal candidate profile, compare this resume against it, and estimate competitive positioning."
@@ -374,6 +417,7 @@ async def skill_plan(
     job_description: str = Form(...),
 ):
     pdf_bytes = await resume.read()
+    validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
     prompt = (
         "Create a 3-month skill plan: top skills to close gaps, resources, weekly timeline, and resume update strategy."
@@ -389,6 +433,7 @@ async def jobs_search(
     count: int = Form(default=5),
 ):
     pdf_bytes = await resume.read()
+    validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
     resume_text = extract_resume_text(images)
     results = tavily_job_search(resume_text=resume_text, job_description=job_description, count=count)
