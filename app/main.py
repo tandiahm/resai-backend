@@ -1,6 +1,9 @@
-import base64
+"""
+ResAI Backend – FastAPI application.
+LLM provider: Anthropic Claude (via llm_provider.py)
+"""
+
 import hashlib
-import io
 import logging
 import os
 import re
@@ -9,36 +12,74 @@ import traceback
 import uuid
 from typing import List
 
-import google.generativeai as genai
 import pdf2image
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from app.llm_provider import (
+    generate_text,
+    generate_with_image,
+    get_model_name,
+    image_to_claude_block,
+)
+
+# ---------------------------------------------------------------------------
+# Environment & config
+# ---------------------------------------------------------------------------
 
 load_dotenv()
 
-api_key = os.getenv("GOOGLE_API_KEY")
-if not api_key:
-    raise RuntimeError("GOOGLE_API_KEY is required")
+# Fail fast if the required key is missing – llm_provider will raise at first
+# call, but an early check here gives a clearer startup error.
+if not os.getenv("ANTHROPIC_API_KEY"):
+    raise RuntimeError("ANTHROPIC_API_KEY is required")
 
-genai.configure(api_key=api_key)
-
-_SELECTED_MODEL_NAME = None
-_SELECTED_MODEL = None
 MAX_RESUME_SIZE_MB = int(os.getenv("MAX_RESUME_SIZE_MB", "10"))
 MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "2"))
-MODEL_RETRY_ATTEMPTS = int(os.getenv("MODEL_RETRY_ATTEMPTS", "3"))
-MODEL_RETRY_BASE_SECONDS = float(os.getenv("MODEL_RETRY_BASE_SECONDS", "1.0"))
 ANALYSIS_CACHE_TTL_SECONDS = int(os.getenv("ANALYSIS_CACHE_TTL_SECONDS", "86400"))
 ANALYSIS_CACHE_MAX_ENTRIES = int(os.getenv("ANALYSIS_CACHE_MAX_ENTRIES", "500"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("resai-backend")
-analysis_cache = {}
 
+# ---------------------------------------------------------------------------
+# In-memory analysis cache
+# ---------------------------------------------------------------------------
+
+analysis_cache: dict = {}
+
+
+def prune_analysis_cache() -> None:
+    now = time.time()
+    expired = [k for k, v in analysis_cache.items() if now - v["ts"] > ANALYSIS_CACHE_TTL_SECONDS]
+    for key in expired:
+        analysis_cache.pop(key, None)
+    if len(analysis_cache) > ANALYSIS_CACHE_MAX_ENTRIES:
+        oldest = sorted(analysis_cache.items(), key=lambda item: item[1]["ts"])[
+            : len(analysis_cache) - ANALYSIS_CACHE_MAX_ENTRIES
+        ]
+        for key, _ in oldest:
+            analysis_cache.pop(key, None)
+
+
+def get_cached_analysis(cache_key: str) -> str | None:
+    prune_analysis_cache()
+    hit = analysis_cache.get(cache_key)
+    return hit["analysis"] if hit else None
+
+
+def set_cached_analysis(cache_key: str, analysis: str) -> None:
+    prune_analysis_cache()
+    analysis_cache[cache_key] = {"analysis": analysis, "ts": time.time()}
+
+
+# ---------------------------------------------------------------------------
+# Pydantic response models
+# ---------------------------------------------------------------------------
 
 class AnalyzeResponse(BaseModel):
     match_percentage: float
@@ -58,7 +99,11 @@ class JobSearchResponse(BaseModel):
     results_markdown: str
 
 
-app = FastAPI(title="ResAI Backend", version="1.0.0")
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="ResAI Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,108 +127,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
     return JSONResponse(
         status_code=500,
-        content={
-            "detail": f"Internal server error (request_id={request_id}).",
-        },
+        content={"detail": f"Internal server error (request_id={request_id})."},
     )
 
 
-def choose_model_name(preferred_env_var: str = "GOOGLE_MODEL") -> str:
-    global _SELECTED_MODEL_NAME
-    if _SELECTED_MODEL_NAME:
-        return _SELECTED_MODEL_NAME
-
-    preferred = os.getenv(preferred_env_var)
-
-    try:
-        models = genai.list_models()
-        names = [getattr(m, "name", str(m)) for m in models]
-    except Exception:
-        names = []
-
-    def bad_variant(name: str) -> bool:
-        lowered = name.lower()
-        return "preview" in lowered or "audio" in lowered
-
-    def latest_by_family(family: str):
-        best_name = None
-        best_score = -9999.0
-        for name in names:
-            lowered = name.lower()
-            if family not in lowered:
-                continue
-            match = re.search(rf"{re.escape(family)}[-_/]?(\d+(?:\.\d+)?)", lowered)
-            version = float(match.group(1)) if match else 0.0
-            score = version + (0 if not bad_variant(name) else -1000)
-            if score > best_score:
-                best_score = score
-                best_name = name
-        if best_name:
-            return best_name
-        for name in names:
-            if family in name.lower() and not bad_variant(name):
-                return name
-        return None
-
-    if preferred:
-        pref = preferred.strip().lower()
-        if pref == "latest":
-            for family in ["gemini", "text-bison", "bison"]:
-                candidate = latest_by_family(family)
-                if candidate:
-                    _SELECTED_MODEL_NAME = candidate
-                    return _SELECTED_MODEL_NAME
-        elif pref.endswith("-latest"):
-            family = pref[:-7]
-            candidate = latest_by_family(family)
-            if candidate:
-                _SELECTED_MODEL_NAME = candidate
-                return _SELECTED_MODEL_NAME
-        else:
-            for name in names:
-                if pref in name.lower() and not bad_variant(name):
-                    _SELECTED_MODEL_NAME = name
-                    return _SELECTED_MODEL_NAME
-            for name in names:
-                if pref in name.lower():
-                    _SELECTED_MODEL_NAME = name
-                    return _SELECTED_MODEL_NAME
-
-    for token in ["gemini-2.5", "gemini-1.5", "gemini", "text-bison", "bison"]:
-        for name in names:
-            if token in name.lower() and not bad_variant(name):
-                _SELECTED_MODEL_NAME = name
-                return _SELECTED_MODEL_NAME
-
-    _SELECTED_MODEL_NAME = names[0] if names else "models/text-bison-001"
-    return _SELECTED_MODEL_NAME
-
-
-def get_model():
-    global _SELECTED_MODEL, _SELECTED_MODEL_NAME
-    if _SELECTED_MODEL is not None:
-        return _SELECTED_MODEL
-
-    tried = set()
-    for _ in range(2):
-        name = choose_model_name()
-        if name in tried:
-            break
-        tried.add(name)
-        try:
-            _SELECTED_MODEL = genai.GenerativeModel(name)
-            return _SELECTED_MODEL
-        except Exception as exc:
-            err = str(exc).lower()
-            if any(token in err for token in ["404", "not found", "unsupported", "not supported"]):
-                _SELECTED_MODEL = None
-                _SELECTED_MODEL_NAME = None
-                continue
-            raise
-
-    _SELECTED_MODEL = genai.GenerativeModel("models/text-bison-001")
-    return _SELECTED_MODEL
-
+# ---------------------------------------------------------------------------
+# PDF helpers
+# ---------------------------------------------------------------------------
 
 def pdf_to_images(pdf_bytes: bytes):
     poppler_path = os.getenv("POPPLER_PATH") or None
@@ -200,7 +150,7 @@ def pdf_to_images(pdf_bytes: bytes):
         ) from exc
 
 
-def validate_resume_upload(filename: str, pdf_bytes: bytes):
+def validate_resume_upload(filename: str, pdf_bytes: bytes) -> None:
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Resume must be a PDF file.")
     max_bytes = MAX_RESUME_SIZE_MB * 1024 * 1024
@@ -211,136 +161,50 @@ def validate_resume_upload(filename: str, pdf_bytes: bytes):
         )
 
 
-def image_to_part(image):
-    img_byte_arr = io.BytesIO()
-    image.save(img_byte_arr, format="JPEG")
-    return {
-        "mime_type": "image/jpeg",
-        "data": base64.b64encode(img_byte_arr.getvalue()).decode(),
-    }
-
-
-def prune_analysis_cache():
-    now = time.time()
-    expired = [k for k, v in analysis_cache.items() if now - v["ts"] > ANALYSIS_CACHE_TTL_SECONDS]
-    for key in expired:
-        analysis_cache.pop(key, None)
-    if len(analysis_cache) > ANALYSIS_CACHE_MAX_ENTRIES:
-        oldest = sorted(analysis_cache.items(), key=lambda item: item[1]["ts"])[: len(analysis_cache) - ANALYSIS_CACHE_MAX_ENTRIES]
-        for key, _ in oldest:
-            analysis_cache.pop(key, None)
-
-
-def get_cached_analysis(cache_key: str):
-    prune_analysis_cache()
-    hit = analysis_cache.get(cache_key)
-    if not hit:
-        return None
-    return hit["analysis"]
-
-
-def set_cached_analysis(cache_key: str, analysis: str):
-    prune_analysis_cache()
-    analysis_cache[cache_key] = {"analysis": analysis, "ts": time.time()}
-
-
-def safe_generate_content(payload, context: str) -> str:
-    last_exc = None
-    for attempt in range(MODEL_RETRY_ATTEMPTS):
-        try:
-            model = get_model()
-            response = model.generate_content(payload)
-            return (response.text or "").strip()
-        except HTTPException:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            err = str(exc).lower()
-            is_rate_limited = any(token in err for token in ["quota", "rate limit", "resource exhausted", "429"])
-            is_timeout = any(token in err for token in ["deadline", "timed out", "timeout"])
-
-            if (is_rate_limited or is_timeout) and attempt < MODEL_RETRY_ATTEMPTS - 1:
-                delay = MODEL_RETRY_BASE_SECONDS * (2 ** attempt)
-                logger.warning(
-                    "Retrying model call context=%s attempt=%s/%s delay=%.1fs error=%s",
-                    context,
-                    attempt + 1,
-                    MODEL_RETRY_ATTEMPTS,
-                    delay,
-                    str(exc),
-                )
-                time.sleep(delay)
-                continue
-
-            if is_rate_limited:
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Model is rate-limited for {context}. Please retry in a minute.",
-                ) from exc
-            if is_timeout:
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"Model request timed out for {context}. Please retry.",
-                ) from exc
-            raise HTTPException(
-                status_code=502,
-                detail=f"Model request failed for {context}.",
-            ) from exc
-    if last_exc:
-        err = str(last_exc).lower()
-        if any(token in err for token in ["quota", "rate limit", "resource exhausted", "429"]):
-            raise HTTPException(
-                status_code=429,
-                detail=f"Model is rate-limited for {context}. Please retry in a minute.",
-            ) from last_exc
-        if any(token in err for token in ["deadline", "timed out", "timeout"]):
-            raise HTTPException(
-                status_code=504,
-                detail=f"Model request timed out for {context}. Please retry.",
-            ) from last_exc
-        raise HTTPException(
-            status_code=502,
-            detail=f"Model request failed for {context}.",
-        ) from last_exc
-    raise HTTPException(status_code=502, detail=f"Model request failed for {context}.")
-
-
-def extract_resume_text(images) -> str:
-    text = []
-    for image in images[:MAX_OCR_PAGES]:
-        try:
-            prompt = "Extract all text from this image, preserving line breaks and formatting as much as possible."
-            extracted = safe_generate_content([prompt, image_to_part(image)], context="resume OCR")
-            if extracted:
-                text.append(extracted)
-        except HTTPException:
-            continue
-    return "\n".join(text)
-
-
-def run_prompt_with_resume(prompt: str, first_page_part: dict, job_description: str) -> str:
-    return safe_generate_content([prompt, first_page_part, job_description], context="resume prompt")
-
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
 
 def parse_percentage(text: str) -> float:
-    match = re.search(r"(\d+(?:\.\d+)?)%", text)
-    if not match:
-        return 0.0
-    try:
-        return float(match.group(1))
-    except ValueError:
-        return 0.0
+    """
+    Extract the first percentage value from model output.
+    Robust: tries explicit XX% pattern first, then looks for numbers near
+    keywords like 'match', 'score', 'fit' so a slightly varied response
+    doesn't silently return 0.
+    """
+    # Primary: look for explicit percent sign
+    match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+    if match:
+        try:
+            return min(float(match.group(1)), 100.0)
+        except ValueError:
+            pass
+
+    # Fallback: look for a number near match-related keywords
+    snippet_match = re.search(
+        r"(?:match|score|fit|compatibility)[^\d]{0,20}(\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    )
+    if snippet_match:
+        try:
+            return min(float(snippet_match.group(1)), 100.0)
+        except ValueError:
+            pass
+
+    return 0.0
 
 
 def extract_keywords(job_description: str) -> List[str]:
     stop_words = {
-        "the", "and", "for", "with", "that", "this", "from", "you", "your", "our", "are", "will",
-        "have", "has", "had", "not", "but", "all", "any", "job", "role", "work", "team", "ability",
-        "experience", "years", "required", "preferred", "skills", "skill", "using", "their", "they",
-        "can", "should", "into", "about", "who", "what", "where", "when", "how", "more", "must",
+        "the", "and", "for", "with", "that", "this", "from", "you", "your", "our",
+        "are", "will", "have", "has", "had", "not", "but", "all", "any", "job",
+        "role", "work", "team", "ability", "experience", "years", "required",
+        "preferred", "skills", "skill", "using", "their", "they", "can", "should",
+        "into", "about", "who", "what", "where", "when", "how", "more", "must",
     }
     words = re.findall(r"[A-Za-z][A-Za-z0-9+.#-]{2,}", job_description.lower())
-    freq = {}
+    freq: dict = {}
     for word in words:
         if word in stop_words:
             continue
@@ -349,20 +213,55 @@ def extract_keywords(job_description: str) -> List[str]:
     return [word for word, _ in ordered[:15]]
 
 
+# ---------------------------------------------------------------------------
+# Resume helpers
+# ---------------------------------------------------------------------------
+
+def extract_resume_text(images) -> str:
+    """OCR up to MAX_OCR_PAGES pages using Claude vision."""
+    text_parts = []
+    for image in images[:MAX_OCR_PAGES]:
+        try:
+            extracted = generate_with_image(
+                prompt="Extract all text from this resume image, preserving line breaks and formatting.",
+                image=image,
+                context="resume OCR",
+            )
+            if extracted:
+                text_parts.append(extracted)
+        except HTTPException:
+            continue
+    return "\n".join(text_parts)
+
+
+def run_prompt_with_resume(prompt: str, image, job_description: str) -> str:
+    """Send a prompt + first-page image + job description to Claude."""
+    return generate_with_image(
+        prompt=prompt,
+        image=image,
+        extra_text=job_description,
+        context="resume prompt",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tavily job search
+# ---------------------------------------------------------------------------
+
 def tavily_job_search(resume_text: str, job_description: str, count: int = 5) -> str:
     tavily_api_key = os.getenv("TAVILY_API_KEY")
     if not tavily_api_key:
-        return "TAVILY_API_KEY is missing"
+        return "Job search is unavailable: TAVILY_API_KEY is not configured."
 
-    skills_response = safe_generate_content(
-        "Extract top 10 professional skills from this resume as a comma-separated list:\n"
+    skills_response = generate_text(
+        "Extract the top 10 professional skills from this resume as a comma-separated list:\n"
         f"{resume_text}",
         context="resume skill extraction",
     )
     resume_skills = skills_response.strip()
 
-    title_response = safe_generate_content(
-        "Extract the exact job title from this job description. Return only the title.\n"
+    title_response = generate_text(
+        "Extract the exact job title from this job description. Return only the title, nothing else.\n"
         f"{job_description}",
         context="job title extraction",
     )
@@ -378,16 +277,18 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
         "max_results": count,
         "include_raw_content": True,
     }
+
     try:
         response = requests.post("https://api.tavily.com/search", json=payload, timeout=60)
     except requests.RequestException:
         return "Job search service is temporarily unavailable. Please retry shortly."
+
     if response.status_code != 200:
         return f"Tavily API error {response.status_code}: {response.text}"
 
     results = response.json().get("results", [])
     if not results:
-        return "No jobs found"
+        return "No matching jobs found."
 
     lines = ["## Personalized Job Search Results\n"]
     for idx, result in enumerate(results, start=1):
@@ -396,27 +297,32 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
         snippet = result.get("raw_content", "No description available")
 
         relevance_prompt = (
-            "Analyze relevance of this job for the candidate. Return: score (0-100%), key matching skills, fit notes.\n"
+            "Analyze relevance of this job for the candidate. Return: score (0-100%), "
+            "key matching skills, and a brief fit note.\n"
             f"Candidate Skills: {resume_skills}\n"
             f"Job Title: {title}\n"
             f"Job Description: {snippet}"
         )
         try:
-            relevance = safe_generate_content(relevance_prompt, context="job relevance analysis")
+            relevance = generate_text(relevance_prompt, context="job relevance analysis")
         except HTTPException:
             relevance = "Relevance analysis unavailable for this result."
 
         lines.append(f"### {idx}. {title}")
         lines.append(f"Link: [{link}]({link})")
-        lines.append(f"Description: {snippet}")
+        lines.append(f"Description: {snippet[:500]}...")
         lines.append(f"Relevance:\n{relevance}\n")
 
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": choose_model_name()}
+    return {"status": "ok", "model": get_model_name(), "provider": "anthropic"}
 
 
 @app.post("/api/resume/analyze", response_model=AnalyzeResponse)
@@ -426,22 +332,25 @@ async def analyze_resume(
 ):
     pdf_bytes = await resume.read()
     validate_resume_upload(resume.filename or "", pdf_bytes)
-    cache_key = hashlib.sha256(pdf_bytes + b"||" + job_description.strip().encode("utf-8")).hexdigest()
-    cached_analysis = get_cached_analysis(cache_key)
-    if cached_analysis:
-        return AnalyzeResponse(match_percentage=parse_percentage(cached_analysis), analysis=cached_analysis)
+
+    cache_key = hashlib.sha256(
+        pdf_bytes + b"||" + job_description.strip().encode("utf-8")
+    ).hexdigest()
+    cached = get_cached_analysis(cache_key)
+    if cached:
+        return AnalyzeResponse(match_percentage=parse_percentage(cached), analysis=cached)
 
     images = pdf_to_images(pdf_bytes)
     if not images:
-        raise HTTPException(status_code=400, detail="No pages found in uploaded PDF")
+        raise HTTPException(status_code=400, detail="No pages found in uploaded PDF.")
 
-    first_page_part = image_to_part(images[0])
     prompt = (
         "You are an experienced technical recruiter. Review this resume against the job description. "
-        "Return sections: OVERVIEW, STRENGTHS, GAPS, MATCH PERCENTAGE, RECOMMENDATION. "
-        "Start with percentage line as 'XX%'."
+        "Structure your response with these sections:\n"
+        "OVERVIEW\nSTRENGTHS\nGAPS\nMATCH PERCENTAGE\nRECOMMENDATION\n\n"
+        "Start the MATCH PERCENTAGE section with a line like: '82%' (just the number and percent sign)."
     )
-    analysis = run_prompt_with_resume(prompt, first_page_part, job_description)
+    analysis = run_prompt_with_resume(prompt, images[0], job_description)
     set_cached_analysis(cache_key, analysis)
     return AnalyzeResponse(match_percentage=parse_percentage(analysis), analysis=analysis)
 
@@ -456,10 +365,10 @@ async def optimize_resume(
     images = pdf_to_images(pdf_bytes)
 
     prompt = (
-        "You are a career coach. Provide 5 specific actionable resume improvements based on this resume and job description. "
-        "Use concise bullet points."
+        "You are a career coach. Provide 5 specific, actionable resume improvements "
+        "based on this resume and job description. Use concise bullet points."
     )
-    suggestions = run_prompt_with_resume(prompt, image_to_part(images[0]), job_description)
+    suggestions = run_prompt_with_resume(prompt, images[0], job_description)
     keywords = extract_keywords(job_description)
     return OptimizeResponse(suggestions=suggestions, keywords=keywords)
 
@@ -478,10 +387,10 @@ async def cover_letter(
 
     prompt = (
         f"Write a tailored 300-400 word cover letter. Company: {company_name}. "
-        f"Hiring Manager: {hiring_manager}. Focus: {focus_areas}. "
-        "Use professional format and concrete relevance to the job description."
+        f"Hiring Manager: {hiring_manager}. Focus areas: {focus_areas}. "
+        "Use professional format and make concrete connections to the job description."
     )
-    content = run_prompt_with_resume(prompt, image_to_part(images[0]), job_description)
+    content = run_prompt_with_resume(prompt, images[0], job_description)
     return TextResponse(content=content)
 
 
@@ -493,11 +402,15 @@ async def interview_prep(
     pdf_bytes = await resume.read()
     validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
+
     prompt = (
-        "Generate interview prep with 5 technical questions, 3 behavioral questions, and 2 gap-risk questions. "
-        "For each, provide answer strategy notes."
+        "Generate an interview prep guide with:\n"
+        "- 5 technical questions (with answer strategy notes)\n"
+        "- 3 behavioral questions (with answer strategy notes)\n"
+        "- 2 gap-risk questions the interviewer may probe (with how to address them)\n"
+        "Base everything on the resume and job description provided."
     )
-    content = run_prompt_with_resume(prompt, image_to_part(images[0]), job_description)
+    content = run_prompt_with_resume(prompt, images[0], job_description)
     return TextResponse(content=content)
 
 
@@ -509,10 +422,12 @@ async def market_position(
     pdf_bytes = await resume.read()
     validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
+
     prompt = (
-        "Create ideal candidate profile, compare this resume against it, and estimate competitive positioning."
+        "Create an ideal candidate profile for this role, compare this resume against it, "
+        "and estimate the candidate's competitive positioning in today's job market for this role."
     )
-    content = run_prompt_with_resume(prompt, image_to_part(images[0]), job_description)
+    content = run_prompt_with_resume(prompt, images[0], job_description)
     return TextResponse(content=content)
 
 
@@ -524,10 +439,15 @@ async def skill_plan(
     pdf_bytes = await resume.read()
     validate_resume_upload(resume.filename or "", pdf_bytes)
     images = pdf_to_images(pdf_bytes)
+
     prompt = (
-        "Create a 3-month skill plan: top skills to close gaps, resources, weekly timeline, and resume update strategy."
+        "Create a focused 3-month skill development plan:\n"
+        "- Top skills to close gaps for this role\n"
+        "- Recommended resources (courses, projects, certifications)\n"
+        "- Weekly timeline\n"
+        "- Resume update strategy after each milestone"
     )
-    content = run_prompt_with_resume(prompt, image_to_part(images[0]), job_description)
+    content = run_prompt_with_resume(prompt, images[0], job_description)
     return TextResponse(content=content)
 
 
