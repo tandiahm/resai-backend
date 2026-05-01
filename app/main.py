@@ -10,6 +10,7 @@ import re
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 import pdf2image
@@ -253,33 +254,36 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
     if not tavily_api_key:
         return "Job search is unavailable: TAVILY_API_KEY is not configured."
 
-    skills_response = generate_text(
-        "Extract the top 10 professional skills from this resume as a comma-separated list:\n"
-        f"{resume_text}",
-        context="resume skill extraction",
-    )
-    resume_skills = skills_response.strip()
-
-    title_response = generate_text(
-        "Extract the exact job title from this job description. Return only the title, nothing else.\n"
-        f"{job_description}",
-        context="job title extraction",
-    )
-    job_title = title_response.strip().split("\n")[0]
+    # Extract skills and job title in parallel
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        skills_fut = pool.submit(
+            generate_text,
+            "Extract the top 10 professional skills from this resume as a comma-separated list:\n"
+            f"{resume_text}",
+            "resume skill extraction",
+        )
+        title_fut = pool.submit(
+            generate_text,
+            "Extract the exact job title from this job description. Return only the title, nothing else.\n"
+            f"{job_description}",
+            "job title extraction",
+        )
+        resume_skills = skills_fut.result().strip()
+        job_title = title_fut.result().strip().split("\n")[0]
 
     search_query = f'"{job_title}" jobs {" ".join(resume_skills.split(",")[:3])} hiring now'
 
     payload = {
         "api_key": tavily_api_key,
         "query": search_query,
-        "search_depth": "advanced",
+        "search_depth": "basic",
         "include_domains": ["linkedin.com", "indeed.com", "glassdoor.com", "monster.com"],
         "max_results": count,
-        "include_raw_content": True,
+        "include_raw_content": False,
     }
 
     try:
-        response = requests.post("https://api.tavily.com/search", json=payload, timeout=60)
+        response = requests.post("https://api.tavily.com/search", json=payload, timeout=30)
     except requests.RequestException:
         return "Job search service is temporarily unavailable. Please retry shortly."
 
@@ -290,28 +294,27 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
     if not results:
         return "No matching jobs found."
 
-    lines = ["## Personalized Job Search Results\n"]
+    # Build job list summary for a single Claude call
+    jobs_summary = "\n\n".join(
+        f"Job {idx}: {r.get('title', 'Untitled')}\nURL: {r.get('url', '#')}\nSnippet: {r.get('content', '')[:300]}"
+        for idx, r in enumerate(results, start=1)
+    )
+    relevance_prompt = (
+        "For each job below, give: match score (0-100%), 2-3 matching skills, one-line fit note.\n"
+        f"Candidate skills: {resume_skills}\n\n{jobs_summary}"
+    )
+    try:
+        relevance_block = generate_text(relevance_prompt, context="job relevance analysis")
+    except HTTPException:
+        relevance_block = ""
+
+    lines = ["## Personalized Job Search Results\n", relevance_block, "\n---\n"]
     for idx, result in enumerate(results, start=1):
         title = result.get("title", "Untitled Job")
         link = result.get("url", "#")
-        snippet = result.get("raw_content", "No description available")
-
-        relevance_prompt = (
-            "Analyze relevance of this job for the candidate. Return: score (0-100%), "
-            "key matching skills, and a brief fit note.\n"
-            f"Candidate Skills: {resume_skills}\n"
-            f"Job Title: {title}\n"
-            f"Job Description: {snippet}"
-        )
-        try:
-            relevance = generate_text(relevance_prompt, context="job relevance analysis")
-        except HTTPException:
-            relevance = "Relevance analysis unavailable for this result."
-
-        lines.append(f"### {idx}. {title}")
-        lines.append(f"Link: [{link}]({link})")
-        lines.append(f"Description: {snippet[:500]}...")
-        lines.append(f"Relevance:\n{relevance}\n")
+        snippet = result.get("content", "No description available")
+        lines.append(f"### {idx}. [{title}]({link})")
+        lines.append(f"{snippet[:300]}...\n")
 
     return "\n".join(lines)
 
