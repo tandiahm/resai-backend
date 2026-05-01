@@ -147,6 +147,7 @@ def _call_with_retry(content: list, context: str) -> str:
             response = client.messages.create(
                 model=model,
                 max_tokens=_MAX_TOKENS,
+                temperature=0,
                 messages=[{"role": "user", "content": content}],
             )
             return _extract_text(response)
