@@ -10,7 +10,6 @@ import re
 import time
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 import pdf2image
@@ -254,24 +253,14 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
     if not tavily_api_key:
         return "Job search is unavailable: TAVILY_API_KEY is not configured."
 
-    # Extract skills and job title in parallel
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        skills_fut = pool.submit(
-            generate_text,
-            "Extract the top 10 professional skills from this resume as a comma-separated list:\n"
-            f"{resume_text}",
-            "resume skill extraction",
-        )
-        title_fut = pool.submit(
-            generate_text,
-            "Extract the exact job title from this job description. Return only the title, nothing else.\n"
-            f"{job_description}",
-            "job title extraction",
-        )
-        resume_skills = skills_fut.result().strip()
-        job_title = title_fut.result().strip().split("\n")[0]
-
-    search_query = f'"{job_title}" jobs {" ".join(resume_skills.split(",")[:3])} hiring now'
+    # Extract job title from first non-empty line of job description
+    job_title = next(
+        (line.strip() for line in job_description.splitlines() if line.strip()),
+        "software engineer",
+    )
+    # Use top keywords from job description for search query
+    keywords = extract_keywords(job_description)[:3]
+    search_query = f'"{job_title}" jobs {" ".join(keywords)} hiring now'
 
     payload = {
         "api_key": tavily_api_key,
