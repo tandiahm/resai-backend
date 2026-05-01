@@ -294,21 +294,7 @@ def tavily_job_search(resume_text: str, job_description: str, count: int = 5) ->
     if not results:
         return "No matching jobs found."
 
-    # Build job list summary for a single Claude call
-    jobs_summary = "\n\n".join(
-        f"Job {idx}: {r.get('title', 'Untitled')}\nURL: {r.get('url', '#')}\nSnippet: {r.get('content', '')[:300]}"
-        for idx, r in enumerate(results, start=1)
-    )
-    relevance_prompt = (
-        "For each job below, give: match score (0-100%), 2-3 matching skills, one-line fit note.\n"
-        f"Candidate skills: {resume_skills}\n\n{jobs_summary}"
-    )
-    try:
-        relevance_block = generate_text(relevance_prompt, context="job relevance analysis")
-    except HTTPException:
-        relevance_block = ""
-
-    lines = ["## Personalized Job Search Results\n", relevance_block, "\n---\n"]
+    lines = [f"## Job Search Results for: {job_title}\n"]
     for idx, result in enumerate(results, start=1):
         title = result.get("title", "Untitled Job")
         link = result.get("url", "#")
